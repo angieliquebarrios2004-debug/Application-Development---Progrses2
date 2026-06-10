@@ -1,0 +1,291 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import '../models/reservist.dart';
+import '../models/promotion_package.dart';
+
+class FirestoreService {
+  final FirebaseFirestore _db = FirebaseFirestore.instance;
+  final String _collection = 'reservists';
+  final String _packagesCollection = 'promotion_packages';
+
+
+  // CREATE - Add new reservist
+  Future<void> addReservist(Reservist reservist) async {
+    await _db.collection(_collection).add(reservist.toFirestore());
+  }
+
+  // READ - Get all reservists as a stream (live updates)
+  Stream<List<Reservist>> getReservists() {
+    return _db
+        .collection(_collection)
+        .orderBy('lastName')
+        .snapshots()
+        .map((snapshot) =>
+            snapshot.docs.map((doc) => Reservist.fromFirestore(doc)).toList());
+  }
+
+  // READ - Get a single reservist by ID
+  Future<Reservist?> getReservistById(String id) async {
+    final doc = await _db.collection(_collection).doc(id).get();
+    if (doc.exists) {
+      return Reservist.fromFirestore(doc);
+    }
+    return null;
+  }
+
+  // UPDATE - Edit reservist info
+  Future<void> updateReservist(String id, Map<String, dynamic> data) async {
+    await _db.collection(_collection).doc(id).update(data);
+  }
+
+  // DELETE - Remove a reservist record
+  Future<void> deleteReservist(String id) async {
+    await _db.collection(_collection).doc(id).delete();
+  }
+
+  // Get counts for dashboard
+  Future<Map<String, int>> getDashboardCounts() async {
+    final snapshot = await _db.collection(_collection).get();
+    final reservists =
+        snapshot.docs.map((doc) => Reservist.fromFirestore(doc)).toList();
+
+    int eligible = 0, overdue = 0, notYet = 0;
+    for (var r in reservists) {
+      switch (r.eligibilityStatus) {
+        case 'Eligible':
+          eligible++;
+          break;
+        case 'Overdue':
+          overdue++;
+          break;
+        default:
+          notYet++;
+      }
+    }
+    return {
+      'total': reservists.length,
+      'eligible': eligible,
+      'overdue': overdue,
+      'notYetEligible': notYet,
+    };
+  }
+
+  // Get eligible reservists (for promotion package creation)
+  Stream<List<Reservist>> getEligibleReservists() {
+    return _db
+        .collection(_collection)
+        .orderBy('lastName')
+        .snapshots()
+        .map((snapshot) => snapshot.docs
+            .map((doc) => Reservist.fromFirestore(doc))
+            .where((r) => r.eligibilityStatus == 'Eligible')
+            .toList());
+  }
+
+  // ============ PROMOTION PACKAGE OPERATIONS ============
+
+  // CREATE - Add new promotion package
+  Future<void> addPromotionPackage(PromotionPackage package) async {
+    await _db.collection(_packagesCollection).add(package.toFirestore());
+  }
+
+  // READ - Get all promotion packages as a stream
+  Stream<List<PromotionPackage>> getPromotionPackages() {
+    return _db
+        .collection(_packagesCollection)
+        .orderBy('createdAt', descending: true)
+        .snapshots()
+        .map((snapshot) => snapshot.docs
+            .map((doc) => PromotionPackage.fromFirestore(doc))
+            .toList());
+  }
+
+  // READ - Get promotion packages by reservist ID
+  Stream<List<PromotionPackage>> getPackagesByReservist(String reservistId) {
+    return _db
+        .collection(_packagesCollection)
+        .where('reservistId', isEqualTo: reservistId)
+        .orderBy('createdAt', descending: true)
+        .snapshots()
+        .map((snapshot) => snapshot.docs
+            .map((doc) => PromotionPackage.fromFirestore(doc))
+            .toList());
+  }
+
+  // READ - Get promotion packages by status
+  Stream<List<PromotionPackage>> getPackagesByStatus(String status) {
+    return _db
+        .collection(_packagesCollection)
+        .where('status', isEqualTo: status)
+        .orderBy('applicationDate', descending: true)
+        .snapshots()
+        .map((snapshot) => snapshot.docs
+            .map((doc) => PromotionPackage.fromFirestore(doc))
+            .toList());
+  }
+
+  // READ - Get a single promotion package by ID
+  Future<PromotionPackage?> getPromotionPackageById(String id) async {
+    final doc = await _db.collection(_packagesCollection).doc(id).get();
+    if (doc.exists) {
+      return PromotionPackage.fromFirestore(doc);
+    }
+    return null;
+  }
+
+  // UPDATE - Update promotion package
+  Future<void> updatePromotionPackage(String id, Map<String, dynamic> data) async {
+    await _db.collection(_packagesCollection).doc(id).update(data);
+  }
+
+  // UPDATE - Update document status in package
+  Future<void> updateDocumentStatus({
+    required String packageId,
+    required String documentName,
+    required String fileUrl,
+    required String fileName,
+  }) async {
+    final packageRef = _db.collection(_packagesCollection).doc(packageId);
+    final doc = await packageRef.get();
+    
+    if (doc.exists) {
+      final package = PromotionPackage.fromFirestore(doc);
+      final updatedDocs = Map<String, DocumentStatus>.from(package.documents);
+      
+      updatedDocs[documentName] = DocumentStatus(
+        isUploaded: true,
+        fileUrl: fileUrl,
+        fileName: fileName,
+        uploadedAt: DateTime.now(),
+      );
+      
+      // Check if all documents are uploaded
+      bool allUploaded = updatedDocs.values.every((d) => d.isUploaded);
+      String newStatus = package.status;
+      
+      if (allUploaded && package.status == 'Pending') {
+        newStatus = 'For Deliberation';
+      }
+      
+      await packageRef.update({
+        'documents': _convertDocumentsToMap(updatedDocs),
+        'status': newStatus,
+        'updatedAt': Timestamp.fromDate(DateTime.now()),
+      });
+    }
+  }
+
+  // UPDATE - Update package status (Approve/Deny)
+  Future<void> updatePackageStatus({
+    required String packageId,
+    required String status,
+    String? promotionOrderNumber,
+    DateTime? effectivePromotionDate,
+    String? denialReason,
+  }) async {
+    final updateData = {
+      'status': status,
+      'updatedAt': Timestamp.fromDate(DateTime.now()),
+    };
+    
+    if (promotionOrderNumber != null) {
+      updateData['promotionOrderNumber'] = promotionOrderNumber;
+    }
+    
+    if (effectivePromotionDate != null) {
+      updateData['effectivePromotionDate'] = Timestamp.fromDate(effectivePromotionDate);
+    }
+    
+    if (denialReason != null) {
+      updateData['denialReason'] = denialReason;
+    }
+    
+    if (status == 'Approved') {
+      updateData['boardDeliberationDate'] = Timestamp.fromDate(DateTime.now());
+    }
+    
+    await _db.collection(_packagesCollection).doc(packageId).update(updateData);
+  }
+
+  // UPDATE - Set board deliberation date
+  Future<void> setBoardDeliberationDate({
+    required String packageId,
+    required DateTime date,
+  }) async {
+    await _db.collection(_packagesCollection).doc(packageId).update({
+      'boardDeliberationDate': Timestamp.fromDate(date),
+      'status': 'For Deliberation',
+      'updatedAt': Timestamp.fromDate(DateTime.now()),
+    });
+  }
+
+  // DELETE - Delete promotion package
+  Future<void> deletePromotionPackage(String id) async {
+    await _db.collection(_packagesCollection).doc(id).delete();
+  }
+
+  // Get package statistics for dashboard
+  Future<Map<String, int>> getPackageStatistics() async {
+    final snapshot = await _db.collection(_packagesCollection).get();
+    final packages = snapshot.docs;
+    
+    return {
+      'total': packages.length,
+      'pending': packages.where((doc) => doc['status'] == 'Pending').length,
+      'forDeliberation': packages.where((doc) => doc['status'] == 'For Deliberation').length,
+      'approved': packages.where((doc) => doc['status'] == 'Approved').length,
+      'denied': packages.where((doc) => doc['status'] == 'Denied').length,
+      'completed': packages.where((doc) => doc['status'] == 'Completed').length,
+    };
+  }
+
+  // ============ HELPER METHODS ============
+
+  // Helper: Convert documents map to Firestore format
+  Map<String, dynamic> _convertDocumentsToMap(Map<String, DocumentStatus> docs) {
+    Map<String, dynamic> result = {};
+    docs.forEach((key, value) {
+      result[key] = value.toMap();
+    });
+    return result;
+  }
+
+  // Search reservists by name or serial number
+  Future<List<Reservist>> searchReservists(String query) async {
+    if (query.isEmpty) {
+      final snapshot = await _db.collection(_collection).get();
+      return snapshot.docs.map((doc) => Reservist.fromFirestore(doc)).toList();
+    }
+    
+    final queryLower = query.toLowerCase();
+    final snapshot = await _db.collection(_collection).get();
+    
+    return snapshot.docs
+        .map((doc) => Reservist.fromFirestore(doc))
+        .where((r) =>
+            r.fullName.toLowerCase().contains(queryLower) ||
+            r.serialNumber.toLowerCase().contains(queryLower))
+        .toList();
+  }
+
+  // Get reservists by rank
+  Future<List<Reservist>> getReservistsByRank(String rank) async {
+    final snapshot = await _db
+        .collection(_collection)
+        .where('rank', isEqualTo: rank)
+        .get();
+    
+    return snapshot.docs
+        .map((doc) => Reservist.fromFirestore(doc))
+        .toList();
+  }
+
+  // Get reservists by eligibility status
+  Future<List<Reservist>> getReservistsByStatus(String status) async {
+    final snapshot = await _db.collection(_collection).get();
+    
+    return snapshot.docs
+        .map((doc) => Reservist.fromFirestore(doc))
+        .where((r) => r.eligibilityStatus == status)
+        .toList();
+  }
+}
